@@ -1,213 +1,246 @@
-# Methods: Multi-Signature Cluster Enrichment Analysis
+# SigClust: Statistical Methods
 
 ## Overview
 
-This analysis answers the question: **"What is each cluster on the UMAP?"** — not by
-running new tools, but by leveraging the 40 gene-expression signatures already scored
-via UCell to functionally annotate every Seurat cluster in every stratum.
+**SigClust** is a method for functionally annotating clusters in single-cell RNA-seq data using pre-computed gene-expression signature scores. It answers the question: *"What biological identity does each cluster represent?"*
 
-In plain language: we already know how much each cell "looks like" a macrophage, a
-myoblast, a T-cell, a pericyte, etc. (from UCell scoring). We also know which cluster
-each cell belongs to (from Seurat's FindClusters). This analysis connects the two:
-for each cluster, it asks "are the cells in this cluster unusually enriched for any
-particular signature?" — and if so, that signature becomes the cluster's identity label.
+The approach connects two independently-derived pieces of information:
+1. **Cluster assignments** — groups of transcriptionally similar cells identified by graph-based clustering (e.g., Seurat's `FindClusters`)
+2. **Signature scores** — per-cell quantification of gene-set activity (e.g., UCell, AUCell, or AddModuleScore)
+
+For each cluster, SigClust asks: *"Are the highest-scoring cells for any given signature statistically over-represented in this cluster?"* If yes — and the enrichment is strong — that signature becomes the cluster's functional label.
+
+This is a **post-hoc annotation method**, not a clustering method. It does not modify cluster boundaries or re-run dimensionality reduction. It simply tells you what each existing cluster *is*, using the gene programs you care about.
 
 ---
 
-## Step-by-Step Methodology
+## Why This Approach?
 
-### Step 1: Input Data
+Traditional cluster annotation methods rely on:
+- **Marker genes** — identify differentially expressed genes per cluster, then manually look them up. Labor-intensive, subjective, non-reproducible.
+- **Reference-based transfer** — project cells onto a labeled atlas (e.g., SingleR, Azimuth). Requires a high-quality reference for your tissue type, which may not exist.
+- **Deconvolution** — estimate cell-type fractions (CIBERSORTx, xCell). Designed for bulk data, not for annotating individual clusters.
 
-For each of the 8 strata (FN/FP × Diff/Progenitor/Stem/NonMalignant):
+SigClust takes a different path: if you already have **curated gene signatures** that define the cell types or states you care about (from the literature, from CellMarker 2.0, from your own experiments), you can score them on every cell and let statistics identify which clusters match which signatures. This is:
+- **Reproducible** — same signatures + same clusters = same annotations every time
+- **Quantitative** — enrichment is measured by odds ratio with confidence intervals, not by eye
+- **Multi-label capable** — a cluster can be significantly enriched for multiple signatures simultaneously (e.g., a cluster that is both "Macrophage" and "Hypoxia-high")
+- **Agnostic** — works with any set of gene signatures (immune, muscle, metabolic, custom)
 
-- **Harmony-integrated Seurat object** (`P2_<stratum>_harmony.rds`)
-  containing UMAP coordinates and Seurat cluster assignments (from FindClusters,
-  resolution 0.5 for malignant, 0.8 for non-malignant)
-- **Pre-computed UCell signature scores** (`batch*_<stratum>_scores.csv`)
-  from the 64 SLURM scoring jobs — 40 signatures scored on every cell
+---
 
-### Step 2: Signature Filtering
+## Statistical Framework
 
-Not every signature is relevant for every stratum. For example, the `CD8_Cytotoxic`
-signature scores near-zero on all cells in a malignant-only stratum (because there are
-no T-cells there). Keeping such signatures would add noise and inflate multiple-testing
-burden.
+### Input Requirements
 
-**Filter rule:** For each signature, compute its maximum UCell score across all cells
-in that stratum. If `max < 0.2`, the signature is dropped (meaning no cell in this
-stratum expresses that program at even a moderate level). This is conservative — 0.2
-on UCell's 0–1 scale typically means "at least some genes in the signature are
-detectably co-expressed."
+| Input | Description | Format |
+|-------|-------------|--------|
+| **Seurat object** | Clustered cells with UMAP coordinates | `.rds` file with `seurat_clusters` metadata column |
+| **Signature scores** | Per-cell scores for N gene signatures | Data frame: rows = cells, columns = signature names, values = scores (0–1 for UCell) |
 
-**Typical retention:** 33–40 out of 40 signatures pass per stratum. NonMalignant
-strata retain all 40 (they contain all cell types). FP_Stem retains only 33 (immune
-signatures drop out — consistent with FP-RMS being "immune cold").
+The signature scores can come from any method that produces a per-cell continuous value:
+- **UCell** (recommended) — rank-based, robust to library size differences
+- **AUCell** — area under the recovery curve
+- **Seurat::AddModuleScore** — z-score relative to control gene sets
+- **GSVA/ssGSEA** — gene set variation analysis (less common for single cells)
 
-### Step 3: Identify "High-Scoring" Cells
+### Step 1: Signature Relevance Filtering
 
-For each retained signature, we define "high-scoring" cells as the **top 10%** — cells
-whose UCell score for that signature is in the 90th percentile or above within that
-stratum. This is:
-- Robust to signature-to-signature scale differences (each gets its own threshold)
-- Biologically meaningful: top 10% captures the cells most strongly expressing the
-  program, regardless of baseline expression level
-- Not arbitrary: 10th percentile is a standard cutoff in scRNA-seq enrichment analyses
-  (used in Tirosh 2016, Kinker 2020, Gavish 2023)
+**Problem:** Not every signature is informative for every dataset. A "B-cell" signature will score near-zero in a dataset of sorted tumor cells. Including such irrelevant signatures inflates the multiple-testing burden without adding information.
 
-### Step 4: Fisher's Exact Test (Cluster Enrichment)
+**Solution:** For each signature, compute its **maximum score** across all cells. If `max(score) < MIN_MAX_SCORE` (default: 0.2), the signature is dropped from analysis.
 
-For each combination of (signature × cluster), we build a 2×2 contingency table:
+**Rationale for 0.2 threshold:** On UCell's 0–1 scale, a score of 0.2 means approximately 20% of the signature's genes are co-expressed above background in at least one cell. Below this, the signature is effectively absent from the dataset. The threshold is conservative — it only removes signatures with zero biological representation, not weak-but-real signals.
 
-|                    | In this cluster | Not in this cluster |
-|--------------------|:-:|:-:|
-| **Top 10% cells**  | a | b |
-| **Other 90% cells**| c | d |
+**This filter is applied per-dataset (or per-stratum if analyzing subsets separately).** A signature might be relevant in one subset but irrelevant in another.
 
-Then compute a **one-sided Fisher's exact test** (alternative = "greater"), asking:
-"Are top-scoring cells for this signature over-represented in this cluster compared
-to what you'd expect by chance?"
+### Step 2: Define "High-Scoring" Cells
 
-The **Odds Ratio (OR)** quantifies how much more likely a top-10% cell is to be in
-this cluster versus elsewhere:
-- OR = 1: no enrichment (top cells are evenly distributed)
-- OR = 5: 5× more likely to find a top-scoring cell in this cluster than expected
-- OR = 100+: extreme enrichment (almost all top cells concentrate in one cluster)
+For each retained signature, cells are classified as **"high"** if their score falls in the **top percentile** (default: top 10%, i.e., 90th percentile threshold).
+
+**Why percentile-based rather than absolute threshold?**
+- Different signatures have different score distributions (a T-cell signature with 200 genes will have different absolute scores than a 15-gene hypoxia signature)
+- Percentile-based thresholding makes the definition comparable across signatures
+- 10% is the standard in the literature (Tirosh et al. 2016, Science; Kinker et al. 2020, Nature Genetics; Gavish et al. 2023, Nature)
+
+**Why 10% specifically?**
+- Too stringent (e.g., top 1%) captures only extreme outliers, missing moderate-but-real expression
+- Too permissive (e.g., top 50%) includes cells with background-level expression, diluting signal
+- 10% balances sensitivity (enough cells to have statistical power per cluster) with specificity (genuinely high-scoring cells only)
+
+The parameter `TOP_PCT` is user-configurable. For datasets with very sharp cell-type boundaries, top 5% may be more appropriate. For datasets with continuous gradients (e.g., developmental trajectories), top 25% may capture more biology.
+
+### Step 3: Enrichment Testing (Fisher's Exact Test)
+
+For every combination of **(signature S, cluster C)**, construct a 2×2 contingency table:
+
+|                        | Cells in cluster C | Cells NOT in cluster C | Row total |
+|------------------------|:------------------:|:----------------------:|:---------:|
+| **Top cells for S**    | a                  | b                      | a + b     |
+| **Non-top cells for S**| c                  | d                      | c + d     |
+| **Column total**       | a + c              | b + d                  | N         |
+
+Where:
+- **a** = number of top-10% cells for signature S that are in cluster C
+- **b** = number of top-10% cells for signature S that are NOT in cluster C
+- **c** = number of non-top cells in cluster C
+- **d** = number of non-top cells not in cluster C
+- **N** = total cells in the dataset
+
+**Test:** One-sided Fisher's exact test (`alternative = "greater"`), testing whether top-scoring cells are **over-represented** in the cluster.
+
+**Why Fisher's exact (not chi-squared)?**
+- Fisher's is exact (no large-sample approximation needed)
+- Handles small cell counts correctly (some clusters have <100 cells)
+- One-sided because we only care about enrichment (over-representation), not depletion
+
+### Step 4: Odds Ratio Interpretation
+
+The **Odds Ratio (OR)** from the Fisher test quantifies enrichment strength:
+
+$$OR = \frac{a \cdot d}{b \cdot c}$$
+
+**Interpretation scale:**
+
+| OR | log₂(OR) | Meaning |
+|----|----------|---------|
+| 1 | 0 | No enrichment — top cells are distributed randomly across clusters |
+| 2 | 1 | 2× more likely to find a top-scoring cell in this cluster than expected |
+| 4 | 2 | 4× enrichment — moderate, biologically meaningful |
+| 8 | 3 | Strong enrichment — the cluster is clearly dominated by this signature |
+| 16+ | 4+ | Very strong — near-complete overlap between cluster and signature |
+| 100+ | 6.6+ | Extreme — the cluster essentially IS the signature (see explanation below) |
+
+**Why log₂(OR) for visualization?** Raw OR values span 0.01 to 500+ — an unmanageable range for heatmaps. Log₂ transformation compresses this to approximately [-3, +9], making patterns visible. It also makes the scale symmetric: log₂(OR) = +2 means "4× enriched" and log₂(OR) = -2 means "4× depleted."
 
 ### Step 5: Multiple-Testing Correction
 
-With ~40 signatures × ~15 clusters per stratum = ~600 tests, we apply
-Benjamini-Hochberg FDR correction. A cluster-signature pair is considered significant
-if `FDR < 0.01` (strict threshold to avoid false annotations).
+With N_signatures × N_clusters tests (typically 30–40 × 10–20 = 300–800 tests per dataset), multiple-testing correction is essential.
+
+**Method:** Benjamini-Hochberg FDR correction, applied across all tests within a dataset.
+
+**Significance threshold:** FDR < 0.01 (default). This is deliberately strict because cluster annotations propagate to all downstream analyses — a false annotation has cascading effects. The threshold is user-configurable via `params$min_fdr`.
+
+A cluster-signature pair is considered **significant** if:
+1. FDR < 0.01, AND
+2. OR ≥ 2 (at minimum 2× enrichment — avoids statistically significant but biologically trivial associations that can occur with very large cell counts)
 
 ### Step 6: Cluster Assignment
 
-Each cluster is assigned the signature with the **highest OR** among all its
-significant associations (OR ≥ 2, FDR < 0.01). The OR value is shown on the UMAP
-label and in the heatmap.
+Each cluster receives a **dominant signature label** — the signature with the highest OR among all its significant associations.
+
+**Important:** A cluster can have MULTIPLE significant signatures (visible in the heatmap), but only the top one becomes the UMAP label. The full multi-signature profile is preserved in the output CSV.
+
+**Unassigned clusters:** If no signature passes both the OR ≥ 2 and FDR < 0.01 thresholds for a given cluster, it is labeled "Unassigned" and colored grey on the UMAP. This typically indicates:
+- A transitional/intermediate population between two cell states
+- A novel cell type not covered by the provided signatures
+- A cluster driven by technical variation (e.g., a sample-specific batch effect)
 
 ---
 
-## Why Are Some Odds Ratios Extremely High (100–460)?
+## Why Are Some Odds Ratios Extremely High (100–500)?
 
-This is not a bug — it reflects the biology of how scRNA-seq clusters form.
+This is **not a bug** — it is expected behavior that reflects how single-cell clustering works.
 
-### Example: FN_Diff, Cluster 5, Pericyte_vSMC signature
-- **282 of 305** cluster-5 cells (92.5%) are in the top-10% for Pericyte_vSMC
-- Only **87 of 3,374** cells outside cluster 5 are top-10% Pericyte_vSMC
-- This produces OR = 460
+### Explanation
 
-### Why this happens:
+Graph-based clustering (Louvain/Leiden on a shared-nearest-neighbor graph) groups cells by **transcriptomic similarity**. When a dataset contains a discrete cell type (e.g., macrophages), those cells will form a tight, well-separated cluster because they share hundreds of co-expressed genes.
 
-**Seurat clusters ARE cell-type-defined groups.** When FindClusters identifies
-cluster 5 based on PCA/Harmony space, it's finding a group of cells that share
-similar overall transcriptomes. If those cells happen to be pericytes, then nearly
-ALL pericyte-signature genes are co-expressed in that cluster — and since UCell
-also detects pericyte genes, the overlap between "cluster 5" and "pericyte-high
-cells" is near-complete.
+UCell (or any signature-scoring method) detects the **same set of co-expressed genes** that defined the cluster in the first place. So if cluster 5 was formed because 300 cells all express CD163/MRC1/STAB1/CSF1R/CD68, and your "Macrophage" signature contains those exact genes, then:
+- Nearly 100% of cluster 5 cells will be in the top 10% for "Macrophage"
+- Nearly 0% of non-cluster-5 cells will be in the top 10% for "Macrophage"
 
-In other words: the cluster was already defined by the same biology the signature
-measures. They're not independent — the high OR reflects a true, near-1:1 mapping
-between the Seurat cluster and the signature.
+This produces a near-diagonal 2×2 table:
 
-**High ORs (50–500) mean:** One cluster almost perfectly captures one cell type.
-This is a GOOD result — it means your clustering resolution is appropriate (not
-over-splitting or under-splitting), and the signature correctly identifies that
-population.
+|                     | In cluster 5 (300 cells) | Not in cluster 5 (4,700 cells) |
+|---------------------|:---:|:---:|
+| **Top 10% Macrophage** | 282 | 218 |
+| **Other 90%**          | 18  | 4,482 |
 
-**Moderate ORs (2–20) mean:** The signature is enriched in a cluster but doesn't
-fully dominate it. This happens when:
-- A cluster contains a mix of cell types (e.g., cluster has both M1 and M2 macrophages)
-- A signature marks a cell STATE rather than a cell TYPE (e.g., Hypoxia, Proliferation)
-  that can be active in multiple clusters
+$$OR = \frac{282 \times 4482}{218 \times 18} = 322$$
 
-**OR = 1 (not significant):** The signature has nothing to do with that cluster.
+### What different OR ranges mean biologically
+
+| OR range | log₂(OR) | Biological interpretation |
+|----------|----------|--------------------------|
+| **100–500** | 6.6–9.0 | The cluster IS the cell type. Near-perfect 1:1 mapping. This means your clustering resolution is appropriate and your signature correctly identifies this population. |
+| **10–100** | 3.3–6.6 | Strong enrichment. The cluster is dominated by this cell type but contains some additional cells (mixed population or over-clustered). |
+| **2–10** | 1.0–3.3 | Moderate enrichment. Common for: (a) cell STATES (hypoxia, proliferation) that span multiple clusters, (b) mixed-identity clusters, or (c) signatures with partial gene overlap to other cell types. |
+| **1** | 0 | No association. The signature has nothing to do with this cluster. |
+| **<1** | <0 | Depletion. The cluster actively LACKS this signature's genes. Informative for negative identity (e.g., "this cluster is NOT immune"). |
 
 ### Mathematical intuition
 
-OR explodes when two things are true simultaneously:
-1. Most top-10% cells for a signature fall in ONE cluster (high `a`)
-2. That cluster contains very few NON-top cells for that signature (low `c`)
+OR becomes extreme when two conditions hold simultaneously:
+1. **High specificity:** Most top-10% cells for a signature concentrate in ONE cluster (cell **a** dominates row 1)
+2. **High purity:** That cluster contains very few cells that are NOT top-scoring (cell **c** is small)
 
-When 92% of cluster-5 is top-10% Pericyte AND 97% of non-cluster-5 is NOT top-10%
-Pericyte, the 2×2 table becomes extremely unbalanced → OR > 100. This is the
-Fisher test working correctly, not an artifact.
+When both specificity and purity exceed 90%, the cross-products in the OR formula produce values > 100. This is the Fisher test working correctly on a clean biological separation — not an artifact or an error.
 
 ---
 
 ## Outputs
 
-### Per stratum (8 strata × 3 outputs = 24 files):
+### Figures
 
-| Output | Location | Description |
-|--------|----------|-------------|
-| Multi-sig UMAP | `figures/qc/P2_multisig_umap_<stratum>.png` | UMAP colored by each cluster's dominant signature. Cluster centroids labeled with `<sig_name> (OR=X.X)` |
-| Enrichment heatmap | `figures/qc/P2_multisig_heatmap_<stratum>.png` | Clusters (rows) × signatures (cols), colored by log2(OR). `*` marks significant cells (FDR<0.01, OR≥2) |
-| Full results table | `tables/qc/P2_multisig_enrichment_<stratum>.csv` | Complete Fisher's exact results: stratum, signature, cluster, n_top_in_cluster, n_cluster, n_top_total, pct_top_in_cluster, odds_ratio, p_value, fdr |
+| Output | Description |
+|--------|-------------|
+| **Enrichment heatmap** | Signatures (rows) × clusters (columns), colored by log₂(OR). Blue = depletion, white = no association, red = enrichment. Cells with significant enrichment (FDR < 0.01, OR > threshold) marked with `*`. Both axes hierarchically clustered to reveal co-enrichment patterns. |
+| **Functional UMAP** | Standard UMAP with each cell colored by its cluster's dominant signature. Unassigned clusters shown in grey. Cluster centroids labeled with signature name. |
+| **Combined panel** | Side-by-side: (A) enrichment heatmap + (B) functional UMAP, for publication-ready display. |
 
-### Summary statistics
+### Tables
 
-| Column | Meaning |
-|--------|---------|
-| `n_top_in_cluster` | Number of top-10% cells for this signature that fall in this cluster |
-| `n_cluster` | Total cells in this cluster |
-| `n_top_total` | Total top-10% cells for this signature (across all clusters) |
-| `pct_top_in_cluster` | % of cluster cells that are top-10% for this signature |
-| `odds_ratio` | Fisher's exact OR (one-sided, "greater") |
-| `p_value` | Raw Fisher p-value |
-| `fdr` | BH-adjusted p-value across all tests within a stratum |
+| Output | Description |
+|--------|-------------|
+| **Full enrichment table** (CSV) | Complete Fisher's exact results for every signature × cluster combination: n_top_in_cluster, n_cluster, n_top_total, pct_top_in_cluster, odds_ratio, p_value, fdr |
+| **Cluster annotations** (CSV) | One row per cluster: cluster_id, dominant_signature, odds_ratio, fdr, n_significant_signatures |
 
 ---
 
 ## Parameters
 
-| Parameter | Value | Justification |
-|-----------|-------|---------------|
-| `MIN_MAX_SCORE` | 0.2 | Drop signatures where no cell scores above 0.2 (too low to be meaningful) |
-| `TOP_PCT` | 0.10 | Top 10% defines "high-scoring" cells — standard in literature |
-| `MIN_OR` | 2.0 | Minimum enrichment for assignment (2× expected = meaningful) |
-| `MIN_PVAL` | 0.01 | FDR threshold for significance (conservative) |
-| Clustering resolution | 0.5 (malignant), 0.8 (nonmalignant) | Matches V5 convention |
+| Parameter | Default | Description | How to adjust |
+|-----------|---------|-------------|---------------|
+| `TOP_PCT` | 0.10 | Percentile threshold for "high-scoring" cells | Decrease (0.05) for sharper cell types; increase (0.25) for continuous gradients |
+| `MIN_MAX_SCORE` | 0.20 | Minimum max-score for a signature to be retained | Lower (0.1) to keep more signatures; raise (0.3) to be stricter |
+| `MIN_OR` | 2.0 | Minimum OR for significant assignment | Raise (4.0) for stricter annotations; lower (1.5) for exploratory |
+| `MIN_FDR` | 0.01 | FDR significance threshold | Standard; rarely needs changing |
+| `LOG2_OR_THRESHOLD` | 1.0 | Minimum log₂(OR) shown in heatmap highlighting | Raise (2.0) to show only strong enrichments |
 
 ---
 
-## Relationship to Other Analyses
+## Assumptions and Limitations
 
-This analysis provides **cluster identity** that is referenced by:
-- **NMF metaprograms (P3/P4):** Which clusters do MP-high cells concentrate in?
-- **Survival (P6):** The protective myeloid/APC signal maps to specific clusters
-- **CopyKAT validation (CK01–CK03):** Which clusters in the malignant strata
-  are potential misclassification candidates (immune signatures scoring high in
-  "malignant" clusters)?
-- **Visium (VS05):** Spot classification mirrors this approach but at spatial resolution
+### Assumptions
+1. **Signatures are biologically valid** — SigClust trusts that the gene lists you provide correctly represent the cell types/states they claim to. Garbage signatures produce garbage annotations.
+2. **Clusters represent biological populations** — if clusters are driven by batch effects or doublets, annotations will be meaningless. QC and batch correction should be done before SigClust.
+3. **UCell scores are comparable across signatures** — the percentile-based thresholding handles scale differences, but extremely short signatures (<5 genes) may produce noisy scores.
+
+### Limitations
+1. **Cannot discover novel cell types** — SigClust can only annotate clusters using the signatures you provide. An unlabeled cluster might be novel biology, or it might be a known cell type for which you didn't include a signature.
+2. **Resolution-dependent** — annotations depend on the clustering resolution chosen upstream. Over-clustered data may split one cell type across multiple clusters; under-clustered data may merge distinct types.
+3. **One dominant label per cluster** — the UMAP visualization shows only the top signature. The full multi-signature profile is in the CSV output. Always check the heatmap for multi-signature clusters.
+4. **Spot-level data (Visium)** — each Visium spot contains multiple cells. SigClust can still be applied, but OR values will be lower (spots are inherently mixed) and interpretation shifts from "cell type" to "dominant program in this region."
 
 ---
 
-## Script Location
+## References
+
+- **UCell:** Andreatta M & Carmona SJ (2021). UCell: Robust and scalable single-cell gene signature scoring. *Computational and Structural Biotechnology Journal* 19:3796-3798.
+- **Fisher's exact test:** Fisher RA (1922). On the interpretation of χ² from contingency tables. *Journal of the Royal Statistical Society* 85:87-94.
+- **Benjamini-Hochberg FDR:** Benjamini Y & Hochberg Y (1995). Controlling the false discovery rate. *Journal of the Royal Statistical Society B* 57:289-300.
+- **Top-10% convention:** Tirosh I et al. (2016). Dissecting the multicellular ecosystem of metastatic melanoma by single-cell RNA-seq. *Science* 352:189-196.
+- **CellMarker 2.0:** Hu C et al. (2023). CellMarker 2.0: an updated database of manually curated cell markers. *Nucleic Acids Research* 51:D1348-D1353.
+- **Seurat clustering:** Hao Y et al. (2024). Dictionary learning for integrative, multimodal and scalable single-cell analysis. *Nature Biotechnology* 42:293-304.
+
+---
+
+## Citation
+
+If you use SigClust in your research, please cite:
 
 ```
-v2/adhoc/P2_multisig_cluster_enrichment.R
+SigClust: Signature-based cluster annotation via enrichment testing.
+https://github.com/bukhariabbas/SigClust
 ```
-
-Dependencies: requires pre-computed score CSVs from the 64 SLURM batch scoring jobs
-(`v2/adhoc/umap_signature_scoring/score_and_plot_batch.R`).
-
----
-
-## Interpretation Guide for Biologists
-
-When you look at the enrichment heatmap:
-- **Red columns** = signatures that concentrate strongly in one or a few clusters
-  (e.g., Pan_Immune, Pericyte, Endothelial). These are "cell-type signatures" —
-  they mark discrete populations.
-- **Uniform/blue columns** = signatures expressed at similar levels across many
-  clusters (e.g., Hypoxia, Proliferative_G2M). These are "cell-state signatures" —
-  they mark transient activities, not permanent identities.
-- **A cluster with OR>50 for a single signature** = that cluster IS that cell type.
-  Near-perfect overlap.
-- **A cluster with OR 2–10 for multiple signatures** = a mixed or transitional
-  population (e.g., a cluster that's partially myoblast, partially mesenchymal).
-
-The dominant-signature UMAP gives you a bird's-eye view: each cluster is colored
-by its strongest association. The heatmap gives you the full picture: a cluster
-might be "dominantly" immune but also enriched for hypoxia and proliferation
-simultaneously.
