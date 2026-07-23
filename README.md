@@ -4,6 +4,13 @@
 
 ## Overview
 
+![SigClust Example](sigclust_example_figure.png)
+
+**Panel A:** Enrichment heatmap showing log₂(OR) of signature enrichment across clusters. Blue = depleted, red = enriched, `*` = statistically significant (OR > 2, FDR < 0.01). Rows with no enrichment (max log₂OR < 1) are removed.
+
+**Panel B:** UMAP colored by each cluster's dominant enriched signature. Cluster numbers overlaid at centroids. Grey = no signature passes enrichment threshold.
+
+
 SigClust takes two inputs:
 1. A **clustered Seurat object** (with UMAP + cluster identities)
 2. **UCell signature scores** (one column per signature, one row per cell)
